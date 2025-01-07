@@ -1,0 +1,160 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import tensorflow as tf
+import tensorflow.keras as keras
+import datetime
+import keras_tuner as tuner
+import keyboard
+from sklearn.model_selection import train_test_split
+
+
+class StopTraining(tf.keras.callbacks.Callback):
+    def __init__(self):
+        super(tf.keras.callbacks.Callback, self).__init__()
+
+    def on_train_batch_end(sekf, epoch, logs={}):
+        if keyboard.is_pressed('esc'):
+            raise tuner.errors.FailedTrialError("Training manually stopped.")
+
+
+def build_model(hp):
+
+    n_classes = 100
+
+    hp_learning_rate = hp.Float('Learning Rate', 0.00001, 0.01, sampling='log')
+    decay_rate = hp.Float('Decay Rate', 0.9, 1.)
+    #ema_momentum = hp.Float('EMA momentum', 0.9, 1.)
+    weight_decay = hp.Float('Weight Decay', 1e-5, 1e-2, sampling='log')
+    steps_multiplier = hp.Choice("Steps multiplier", [1, 2, 3])
+
+    n_layers = hp.Choice('Layers', [3, 4, 5])
+    n_filter = hp.Choice('Starting Filters', [8, 16, 32, 64])
+    n_repeats = hp.Choice('Layer Repeats', [1, 2, 3])
+    n_dense = hp.Choice('Dense Neurons', [128, 256, 512, 1024])
+    use_skip = hp.Boolean('Use Skip')
+    dropout = hp.Choice('Dropout', [0.05, 0.1, 0.15, 0.2])
+    pooling = hp.Choice('Pooling', ['avg', 'max'])
+
+    random_flip = hp.Boolean('Random Flip')
+    translation_scale = hp.Choice('Translation Scaling', [0., 0.1])
+    rotation_scale = hp.Choice('Rotation', [0., 0.1])
+    zooming_scale = hp.Choice('Zoom', [0., 0.1])
+    brightness_scale = hp.Choice('Brightness', [0., 0.1])
+    contrast_scale = hp.Choice('Contrast', [0., 0.1])
+    interpolation = hp.Choice('Interpolation', ['bilinear'])
+    fill_mode = hp.Choice('Fill Mode', ['constant', 'wrap',])
+
+    inputs = tf.keras.layers.Input(shape=(32, 32, 3))
+
+    inputs_pre = inputs 
+    inputs_pre = tf.keras.layers.RandomFlip("horizontal")(inputs) if random_flip else inputs_pre
+    inputs_pre = tf.keras.layers.RandomTranslation(translation_scale, translation_scale, fill_mode=fill_mode, interpolation=interpolation)(inputs_pre) if translation_scale else inputs_pre
+    inputs_pre = tf.keras.layers.RandomRotation(rotation_scale, fill_mode=fill_mode, interpolation=interpolation)(inputs_pre) if rotation_scale else inputs_pre
+    inputs_pre = tf.keras.layers.RandomZoom(zooming_scale, fill_mode=fill_mode, interpolation=interpolation)(inputs_pre) if zooming_scale else inputs_pre
+    inputs_pre = tf.keras.layers.RandomBrightness(brightness_scale)(inputs_pre) if brightness_scale else inputs_pre
+    inputs_pre = tf.keras.layers.RandomContrast(contrast_scale)(inputs_pre) if contrast_scale else inputs_pre
+
+    # inputs_pre = keras.layers.BatchNormalization()(inputs_pre)
+
+    # inputs = tf.keras.layers.Input(shape=(32, 32, 3))
+    # inputs_pre = keras.layers.BatchNormalization()(inputs)
+
+    if use_skip:
+        x_skip = inputs_pre
+    
+    x = keras.layers.Conv2D(filters=n_filter, strides=1, kernel_size=7, padding='same', kernel_initializer='he_normal')(inputs_pre)
+    x = keras.layers.BatchNormalization()(x)
+    x = keras.layers.ReLU()(x)
+
+    if use_skip:
+        x_skip = keras.layers.Conv2D(filters=n_filter, strides=1, kernel_size=1)(x_skip)
+        x = keras.layers.Add()([x, x_skip])
+
+
+    for j in range(n_layers):
+        current_n_filters = n_filter*(2**j)
+        for i in range(n_repeats):
+            
+            if use_skip:
+                x_skip = keras.layers.Conv2D(filters=current_n_filters, strides=1, kernel_size=1)(x)
+
+            x = keras.layers.Conv2D(filters=current_n_filters, strides=1, kernel_size=3, padding='same', kernel_initializer='he_normal')(x)
+            x = keras.layers.BatchNormalization()(x)
+            x = keras.layers.ReLU()(x)
+
+            if use_skip:
+                x = keras.layers.Conv2D(filters=current_n_filters, strides=1, kernel_size=3, padding='same', kernel_initializer='he_normal')(x)
+                x = keras.layers.BatchNormalization()(x)
+                
+                x = keras.layers.Add()([x, x_skip])
+
+                x = keras.layers.ReLU()(x)
+        if pooling == 'max':
+            x = keras.layers.MaxPooling2D((2,2))(x)
+        else:
+            x = keras.layers.AveragePooling2D((2,2))(x)
+
+    
+    x = keras.layers.Flatten()(x)
+
+    x = keras.layers.Dense(n_dense, activation='relu', kernel_initializer='he_normal')(x)
+    x = keras.layers.Dropout(dropout)(x)
+    x = keras.layers.Dense(n_dense, activation='relu', kernel_initializer='he_normal')(x)
+    x = keras.layers.Dropout(dropout)(x)
+
+    outputs = keras.layers.Dense(n_classes, activation='softmax')(x)
+
+    lr_schedule = keras.optimizers.schedules.ExponentialDecay(initial_learning_rate=hp_learning_rate, decay_steps=704*steps_multiplier, decay_rate=decay_rate)
+    optimizer = keras.optimizers.Nadam(learning_rate=lr_schedule, weight_decay=weight_decay)
+
+    model = keras.Model(inputs=inputs, outputs=outputs)
+    model.compile(loss='categorical_crossentropy', metrics=['accuracy', 'precision', 'recall', 'f1_score'], optimizer=optimizer)
+    model.summary()
+
+    return model
+
+
+if __name__ == '__main__':
+    (x_train_full, y_train_full), (x_test, y_test) = keras.datasets.cifar100.load_data(label_mode="fine")
+
+    n_samples_train = np.arange(len(x_train_full))
+    n_samples_test = np.arange(len(x_test))
+
+    train_inds, val_inds = train_test_split(n_samples_train, stratify=y_train_full.flatten(), random_state=1337, test_size=0.1)
+
+    x_train = x_train_full[train_inds]
+    y_train = y_train_full[train_inds]
+
+    x_val = x_train_full[val_inds]
+    y_val = y_train_full[val_inds]
+
+    y_train = tf.one_hot(y_train, 100)[:, 0, :]
+    y_val = tf.one_hot(y_val, 100)[:, 0, :]
+    y_test = tf.one_hot(y_test, 100)[:, 0, :]
+
+    x_train = x_train / 255
+    x_val = x_val / 255
+    x_test = x_test / 255
+
+    log_dir = "logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
+
+    # manual_stop_callback = StopTraining()
+
+    tuner = tuner.BayesianOptimization(build_model, objective='val_loss', max_trials=200, overwrite=False, project_name='Bayes_test_strat', max_consecutive_failed_trials=100)
+    tuner.search(x_train, y_train, epochs=200, validation_data=(x_val, y_val), batch_size=64, shuffle=True, callbacks=[tf.keras.callbacks.EarlyStopping(patience=10, min_delta=0.05)])
+
+    best_model = tuner.get_best_models()[0]
+    best_model.save('Bayesian_best.keras')
+
+    predictions = best_model.predict(x_test)
+
+    accuracy = tf.keras.metric.Accuracy().update_state(predictions, y_test).result()
+    F1_score = tf.keras.metrics.F1Score().update_state(predictions, y_test).result()
+    precision = tf.keras.metrics.Precision().update_state(predictions, y_test).result()
+    recall = tf.keras.metrics.Recall().update_state(predictions, y_test).result()
+
+    print(f"Accuracy: {accuracy}, F1 Score: {F1_score}, Precision: {precision}, Recall: {recall}")
+
+    best_model.evaluate(x_test, y_test)
+
